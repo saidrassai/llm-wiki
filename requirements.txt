@@ -1,1 +1,2 @@
 pymupdf>=1.25.0
+croniter>=2.0.0
