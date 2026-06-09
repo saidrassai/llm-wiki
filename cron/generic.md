@@ -1,29 +1,64 @@
 # wiki-rag Ingest — Generic Cron (Any System)
 
-This is a generic cron definition that can be adapted to any system.
+## Standard Cron Syntax
 
-## Schedule
-Every 30 minutes
+wiki-rag uses standard 5-field cron expressions:
 
-## Steps
-1. Read manifest.json from WIKI_PATH
-2. Find first entry where "ingested" is false
-3. Read the raw markdown file at entry["raw_path"]
-4. Read SCHEMA.md for tag taxonomy
-5. Call LLM API to synthesize wiki page:
-   - Prompt: Paper content + schema tags + existing page titles
-   - Model: Configured via LLM_MODEL env var
-   - Output: Markdown with YAML frontmatter
-6. Save wiki page to entities/{slug}.md
-7. Update manifest.json (set ingested: true)
-8. Update index.md (add entry, bump count)
-9. Append to log.md
+```
+minute hour day-of-month month day-of-week
+```
 
-## Environment Variables
-- LLM_API_KEY: API key
-- LLM_API_BASE: API base URL (default: https://api.openai.com/v1)
-- LLM_MODEL: Model name (default: gpt-4o)
-- WIKI_PATH: Path to wiki directory (default: ~/wiki-rag)
+## Schedule Examples
 
-## Python Implementation
-See wiki_rag/ingest.py for the reference implementation.
+| Schedule | Cron Expression |
+|----------|----------------|
+| Every 30 minutes | `*/30 * * * *` |
+| Every hour | `0 * * * *` |
+| Every 2 hours | `0 */2 * * *` |
+| Daily at 9am | `0 9 * * *` |
+| Daily at 6am | `0 6 * * *` |
+| Weekly (Monday 6am) | `0 6 * * 1` |
+| Weekdays at 9am | `0 9 * * 1-5` |
+
+## System Crontab Example
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add wiki-rag ingest (every 30 min)
+*/30 * * * * cd /home/user && /usr/bin/python3 -c "
+import json
+from pathlib import Path
+from wiki_rag import Ingester
+
+wiki_path = Path.home() / 'wiki-rag'
+i = Ingester(wiki_path)
+result = i.ingest_next()
+if result['success']:
+    print(f'Ingested: {result[\"frontmatter\"].get(\"title\", \"unknown\")}')
+" >> /tmp/wiki-rag.log 2>&1
+```
+
+## Python Schedule Example
+
+```python
+from apscheduler.schedulers.blocking import BlockingScheduler
+from wiki_rag import Ingester
+
+ingester = Ingester("~/wiki-rag")
+scheduler = BlockingScheduler()
+
+@scheduler.scheduled_job('cron', minute='*/30')
+def ingest_paper():
+    result = ingester.ingest_next()
+    if result['success']:
+        print(f"Ingested: {result['frontmatter'].get('title', 'unknown')}")
+
+scheduler.start()
+```
+
+## Notes
+- Each run processes 1 paper from the manifest queue
+- Requires LLM_API_KEY environment variable
+- Raw papers must be collected first (Phase 1)
