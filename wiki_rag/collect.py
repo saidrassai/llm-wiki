@@ -1,88 +1,64 @@
+#!/usr/bin/env python3
 """
-Phase 1: Paper collection and extraction.
+wiki-rag-collect.py — Deterministic paper collector (zero LLM tokens)
 
-Downloads TeX or PDF from ArXiv, extracts structured content.
-Zero LLM calls — pure Python with no API dependencies.
+Three-tier pipeline:
+  1. TeX source (best) — structure-preserving LaTeX extraction
+  2. Digital PDF (fast) — PyMuPDF in-memory text block extraction
+  3. Scanned PDF — skipped (rare for ArXiv, <5%)
+
+Run: python3 ~/.hermes/scripts/wiki-rag-collect.py [--max 5]
 """
 
-import json
-import re
-import urllib.request
-import tarfile
+import json, re, sys, tarfile, urllib.request, urllib.error
+from datetime import date
 from pathlib import Path
 from io import BytesIO
-from .config import Config
 
-__all__ = ["collect_paper", "collect_batch", "Collector"]
+# ── Config ────────────────────────────────────────────────────────
+WIKI_PATH = Path("/home/ubuntu/wiki-rag")
+RAW_DIR = WIKI_PATH / "raw" / "papers"
+MANIFEST_FILE = WIKI_PATH / "manifest.json"
+PAPERS_JSON = WIKI_PATH / "categorized_papers_2024_2026.json"
 
+# ── Helpers ───────────────────────────────────────────────────────
 
 def slugify(arxiv_id: str) -> str:
-    """Normalize arxiv id: strip version suffix."""
     return re.sub(r'v\d+$', '', arxiv_id.strip())
 
+def load_manifest_index() -> tuple:
+    """Load manifest and return (manifest_list, id_set, raw_stem_set, skipped_ids) for O(1) lookups."""
+    if not MANIFEST_FILE.exists():
+        return [], set(), set(), set()
+    manifest = json.loads(MANIFEST_FILE.read_text())
+    id_set = set()
+    raw_stem_set = set()
+    skipped_ids = set()
+    for entry in manifest:
+        sid = slugify(entry.get("arxiv_id", ""))
+        id_set.add(sid)
+        id_set.add(entry.get("arxiv_id", ""))
+        raw_fn = entry.get("raw_filename", "")
+        if raw_fn:
+            raw_stem_set.add(Path(raw_fn).stem)
+        if entry.get("skipped") and not entry.get("ingested"):
+            skipped_ids.add(sid)
+    return manifest, id_set, raw_stem_set, skipped_ids
 
-def download_source(arxiv_id: str):
-    """
-    Download paper source from ArXiv.
-    Returns (content_bytes, mime_type) or (None, None).
-    
-    Priority: TeX tar.gz → PDF
-    """
-    sid = slugify(arxiv_id)
-    headers = {'User-Agent': Config.USER_AGENT}
-    
-    # Try TeX source
-    for url in [f"https://arxiv.org/e-print/{sid}", f"https://arxiv.org/src/{sid}"]:
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=Config.REQUEST_TIMEOUT) as resp:
-                data = resp.read()
-            if len(data) > 2 and data[0] == 0x1f and data[1] == 0x8b:
-                return data, "tex"
-            if len(data) > 4 and data[:4] == b'%PDF':
-                return data, "pdf"
-        except Exception:
-            continue
-    
-    # Try PDF directly
-    try:
-        url = f"https://arxiv.org/pdf/{sid}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=Config.REQUEST_TIMEOUT) as resp:
-            data = resp.read()
-        if len(data) > 4 and data[:4] == b'%PDF':
-            return data, "pdf"
-    except Exception:
-        pass
-    
-    return None, None
+def already_collected(sid: str, raw_stem: str, id_set: set, raw_stem_set: set, skipped_ids: set = None) -> bool:
+    """O(1) check if paper already collected or skipped."""
+    if skipped_ids and sid in skipped_ids:
+        return True
+    return sid in id_set or raw_stem in raw_stem_set
 
-
-def extract_tex(tar_bytes: bytes) -> str:
-    """Extract main .tex file from ArXiv tar.gz."""
-    with tarfile.open(fileobj=BytesIO(tar_bytes), mode='r:gz') as tar:
-        tex_files = sorted(
-            [m for m in tar.getmembers() if m.name.endswith('.tex')],
-            key=lambda m: m.size, reverse=True
-        )
-        if not tex_files:
-            return ""
-        content = tar.extractfile(tex_files[0]).read().decode('utf-8', errors='replace')
-        # If main file is small, concatenate all .tex files
-        if len(content) < 2000 and len(tex_files) > 1:
-            parts = []
-            for tf in tex_files[:5]:
-                c = tar.extractfile(tf)
-                if c:
-                    parts.append(c.read().decode('utf-8', errors='replace'))
-            content = '\n\n'.join(parts)
-    return content
-
+# ── TeX Pipeline ──────────────────────────────────────────────────
 
 def strip_latex(text: str) -> str:
-    """Convert LaTeX to plain markdown text."""
+    """Structure-preserving LaTeX to markdown conversion."""
+    # Remove comments
     text = re.sub(r'(?<!\\)%.*$', '', text, flags=re.MULTILINE)
     
+    # Keep only \begin{document}...\end{document}
     doc_start = re.search(r'\\begin\{document\}', text)
     doc_end = re.search(r'\\end\{document\}', text)
     if doc_start and doc_end:
@@ -90,62 +66,97 @@ def strip_latex(text: str) -> str:
     elif doc_start:
         text = text[doc_start.end():]
     
-    # Tables
-    text = _convert_tabular(text)
+    # Preamble
+    text = re.sub(r'\\documentclass(\[[^\]]*\])?\{[^}]*\}', '', text)
+    text = re.sub(r'\\usepackage(\[[^\]]*\])?\{[^}]*\}', '', text)
+    text = re.sub(r'\\(newcommand|renewcommand|def)(\[[^\]]*\])?\{[^}]*\}(\[[^\]]*\])?(\{[^}]*\})?', '', text)
     
-    # Remove environments
+    # Tables: convert tabular → markdown
+    text = convert_tabular_to_markdown(text)
+    
+    # Remove environments (preserve equations)
     for env in ['figure', 'table', 'table*', 'algorithm', 'algorithmic', 'tikzpicture',
-                'itemize', 'enumerate', 'description', 'minipage']:
+                'itemize', 'enumerate', 'description', 'verbatim', 'lstlisting',
+                'minipage', 'center', 'flushleft', 'flushright']:
         text = re.sub(r'\\begin\{' + env + r'\}.*?\\end\{' + env + r'\}', '', text, flags=re.DOTALL)
     
-    # Sections → markdown
+    # Sections → markdown headers
     text = re.sub(r'\\section\*?\{([^}]*)\}', r'\n## \1\n', text)
     text = re.sub(r'\\subsection\*?\{([^}]*)\}', r'\n### \1\n', text)
     text = re.sub(r'\\subsubsection\*?\{([^}]*)\}', r'\n#### \1\n', text)
     
-    # Formatting
-    for cmd in ['textbf', 'textit', 'emph', 'textsc', 'texttt']:
+    # Formatting: keep content
+    for cmd in ['textbf', 'textit', 'emph', 'underline', 'textsc', 'texttt',
+                'mathrm', 'mathit', 'mathbf', 'mathbb', 'mathcal', 'mathfrak',
+                'text', 'textsf', 'textsl', 'textup', 'textrm']:
         text = re.sub(r'\\' + cmd + r'\{([^}]*)\}', r'\1', text)
     
-    # Citations
-    text = re.sub(r'\\(cite\w*|ref|label)\*?(\[[^\]]*\])?\{[^}]*\}', '', text)
+    # Citations/refs
+    text = re.sub(r'\\(label|ref|eqref|autoref|pageref|cite\w*|nocite|parencite|textcite)\*?(\[[^\]]*\])?\{[^}]*\}', '', text)
+    
+    # URLs
+    text = re.sub(r'\\url\{([^}]*)\}', r'\1', text)
+    text = re.sub(r'\\href\{[^}]*\}\{([^}]*)\}', r'\1', text)
+    
+    # Footnotes, captions
+    text = re.sub(r'\\footnote\{[^{}]*(\{[^}]*\}[^{}]*)*\}', '', text)
+    text = re.sub(r'\\caption\*?\{([^}]*)\}', r'\n**Caption:** \1\n', text)
+    
+    # Layout
+    text = re.sub(r'\\(vspace|hspace|vfill|hfill|newline|linebreak|pagebreak|noindent|indent|centering|raggedright|raggedleft|hline|toprule|midrule|bottomrule|cline)\*?\{[^}]*\}', '', text)
+    
+    # Inline math: preserve with $...$
+    # (already in good shape from source)
+    
+    # Itemize
+    text = re.sub(r'\\item\b', '- ', text)
+    
+    # Special chars
+    text = re.sub(r'\~', ' ', text)
+    text = re.sub(r'\\&', '&', text)
+    text = re.sub(r'\\%', '%', text)
+    text = re.sub(r'\\#', '#', text)
+    text = re.sub(r'\\_', '_', text)
     
     # Remaining commands
     text = re.sub(r'\\[a-zA-Z]+\*?(?:\[[^\]]*\])?(?:\{[^}]*\})?', '', text)
+    text = re.sub(r'\\[a-zA-Z]+\*?(?:\[[^\]]*\])?', '', text)
     text = re.sub(r'\\[a-zA-Z]+\b', '', text)
     
-    # Clean
-    text = re.sub(r'\$[^$]+\$', '', text)
+    # Stray brackets
+    text = re.sub(r'\[figure\]|\[table\]|\[h\]|\[t\]|\[b\]|\[p\]|\[H\]|\[!\w+\]', '', text)
     text = re.sub(r'[{}]', '', text)
+    
+    # Whitespace
     text = re.sub(r' {3,}', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'^\s+', '', text, flags=re.MULTILINE)
     
     return text.strip()
 
-
-def _convert_tabular(text: str) -> str:
-    """Convert LaTeX tabular to markdown table."""
-    def replace(m):
+def convert_tabular_to_markdown(text: str) -> str:
+    """Convert LaTeX tabular → markdown table."""
+    def replace_tabular(m):
         content = m.group(1)
         rows = re.sub(r'\\\\', '\n', content)
         rows = re.sub(r'\\hline', '', rows)
         lines = [l.strip() for l in rows.split('\n') if l.strip()]
         if not lines:
             return ''
-        md = []
+        md_lines = []
         for line in lines:
-            line = re.sub(r'\s*&\s*', ' | ', line.strip('&').strip())
-            md.append(f'| {line} |')
-        if len(md) > 1:
-            cols = md[0].count('|') - 1
-            md.insert(1, '|' + ' --- |' * cols)
-        return '\n' + '\n'.join(md) + '\n'
+            line = line.strip('&').strip()
+            line = re.sub(r'\s*&\s*', ' | ', line)
+            md_lines.append(f'| {line} |')
+        if len(md_lines) > 1:
+            cols = md_lines[0].count('|') - 1
+            md_lines.insert(1, '|' + ' --- |' * cols)
+        return '\n' + '\n'.join(md_lines) + '\n'
     
-    return re.sub(r'\\begin\{tabular\}\{[^}]*\}(.*?)\\end\{tabular\}', replace, text, flags=re.DOTALL)
+    return re.sub(r'\\begin\{tabular\}\{[^}]*\}(.*?)\\end\{tabular\}', replace_tabular, text, flags=re.DOTALL)
 
-
-def extract_structure(tex: str) -> dict:
-    """Extract structured data from TeX content."""
+def extract_tex_structure(tex: str) -> dict:
+    """Extract structured data from TeX."""
     s = {"title": "", "abstract": "", "sections": [], "equations": [], "tables": [], "figures": []}
     
     m = re.search(r'\\title\{([^}]*)\}', tex)
@@ -168,9 +179,10 @@ def extract_structure(tex: str) -> dict:
     
     return s
 
+# ── PyMuPDF Pipeline (in-memory, no /tmp) ──────────────────────────
 
 def is_digital_pdf(pdf_bytes: bytes) -> bool:
-    """Check if PDF has extractable text (not scanned)."""
+    """Check if PDF has extractable text. In-memory, no disk I/O."""
     if not pdf_bytes or len(pdf_bytes) < 100:
         return False
     try:
@@ -182,140 +194,251 @@ def is_digital_pdf(pdf_bytes: bytes) -> bool:
         text_pages = sum(1 for p in doc if len(p.get_text().strip()) > 100)
         doc.close()
         return text_pages / len(doc) > 0.7
-    except ImportError:
-        return False
     except Exception:
         return False
 
-
-def extract_pdf_text(pdf_bytes: bytes) -> dict:
-    """Extract text from digital PDF. In-memory, no disk I/O."""
-    import fitz
+def extract_pdf_structure(pdf_bytes: bytes) -> dict:
+    """Extract structured text from digital PDF. In-memory, no disk I/O."""
+    try:
+        import fitz
+    except ImportError:
+        return None
+    
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     structure = {"title": "", "abstract": "", "sections": [], "pages": []}
     
     for i, page in enumerate(doc):
         text = page.get_text()
-        structure["pages"].append({"page_num": i + 1, "text": text})
+        blocks = page.get_text("blocks")
         
+        structure["pages"].append({
+            "page_num": i + 1,
+            "text": text,
+            "block_count": len(blocks)
+        })
+        
+        # Title: first page, top blocks
         if i == 0:
-            structure["title"] = text.split('\n')[0].strip() if text else ""
+            top = sorted(blocks, key=lambda b: b[1])[:3] if blocks else []
+            for b in top:
+                if len(b) > 4 and len(b[4].strip()) > 10:
+                    structure["title"] = b[4].strip()
+                    break
+            
+            # Abstract: find "Abstract" heading, extract until next section
             if 'abstract' in text.lower():
-                idx = text.lower().index('abstract')
-                abs_text = text[idx:idx+1500]
-                end = re.search(r'\n\s*\n\s*\n|\n\d+\.\s+[A-Z]', abs_text[200:])
-                structure["abstract"] = abs_text[:end.start()+200].strip() if end else abs_text.strip()
+                abs_idx = text.lower().index('abstract')
+                abs_text = text[abs_idx:abs_idx + 1500]
+                # End at next section header or double newline after 200+ chars
+                end = re.search(r'\n\s*\n\s*\n|\n## |\n\d+\.\s+[A-Z]', abs_text[200:])
+                if end:
+                    structure["abstract"] = abs_text[:end.start() + 200].strip()
+                else:
+                    structure["abstract"] = abs_text.strip()
+        
+        # Section headers: numbered short lines
+        for b in blocks:
+            if len(b) > 4:
+                bt = b[4].strip()
+                if re.match(r'^\d+\.?\s+[A-Z]', bt) and len(bt) < 80 and not bt.endswith('.'):
+                    structure["sections"].append({"title": bt, "page": i + 1})
     
     doc.close()
     return structure
 
+# ── Download ───────────────────────────────────────────────────────
 
-def collect_paper(arxiv_id: str) -> dict:
-    """
-    Collect a single paper. Phase 1 of the pipeline.
-    
-    Returns:
-        {
-            "arxiv_id": str,
-            "source_type": "tex" | "pdf" | None,
-            "markdown": str,
-            "json": dict,
-            "success": bool,
-            "error": str | None
-        }
-    """
-    result = {"arxiv_id": arxiv_id, "source_type": None, "markdown": "", "json": {}, "success": False, "error": None}
+def download_tex(arxiv_id: str):
+    """Download TeX. Returns (content, 'tex') or (None, 'failed')."""
     sid = slugify(arxiv_id)
+    for url in [f"https://arxiv.org/e-print/{sid}", f"https://arxiv.org/src/{sid}"]:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'wiki-rag/1.0'})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            if len(data) > 2 and data[0] == 0x1f and data[1] == 0x8b:
+                with tarfile.open(fileobj=BytesIO(data), mode='r:gz') as tar:
+                    tex_files = sorted([m for m in tar.getmembers() if m.name.endswith('.tex')],
+                                       key=lambda m: m.size, reverse=True)
+                    if tex_files:
+                        content = tar.extractfile(tex_files[0]).read().decode('utf-8', errors='replace')
+                        if len(content) > 500:
+                            return content, "tex"
+        except Exception as e:
+            print(f"    DEBUG tex: {e}")
+    return None, "failed"
+
+def download_pdf(arxiv_id: str):
+    """Download PDF. Returns (bytes, 'pdf') or (None, 'failed')."""
+    sid = slugify(arxiv_id)
+    for url in [f"https://arxiv.org/e-print/{sid}", f"https://arxiv.org/pdf/{sid}"]:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'wiki-rag/1.0'})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            if len(data) > 4 and data[:4] == b'%PDF':
+                return data, "pdf"
+        except Exception as e:
+            print(f"    DEBUG pdf: {e}")
+    return None, "failed"
+
+# ── Main Pipeline ─────────────────────────────────────────────────
+
+def process_paper(arxiv_id, title, authors, abstract, category):
+    """Three-tier pipeline: TeX → digital PDF → skip."""
+    sid = slugify(arxiv_id)
+    result = {"arxiv_id": arxiv_id, "source_type": None, "markdown": "", "json": {}, "success": False}
     
-    data, mime = download_source(arxiv_id)
-    if not data:
-        result["error"] = "Could not download paper"
+    # Tier 1: TeX
+    tex, st = download_tex(arxiv_id)
+    if tex:
+        result["source_type"] = "tex"
+        clean = strip_latex(tex)
+        structure = extract_tex_structure(tex)
+        structure["title"] = title or structure.get("title", "")
+        structure["abstract"] = abstract or structure.get("abstract", "")
+        
+        md = [
+            "---", f"source_url: https://arxiv.org/abs/{sid}",
+            f"ingested: {date.today().isoformat()}", "sha256: pending", "---",
+            "", f"# {title}", "", f"**Authors:** {authors}",
+            f"**arXiv:** {sid}", "**Source:** tex", "", "## Abstract", "", abstract, "",
+            clean
+        ]
+        result["markdown"] = "\n".join(md)
+        result["json"] = structure
+        result["success"] = True
+        print(f"    ✓ TeX ({len(clean)} chars, {len(structure['sections'])} sections)")
         return result
     
-    if mime == "tex":
-        result["source_type"] = "tex"
-        tex = extract_tex(data)
-        if not tex:
-            result["error"] = "No TeX files found in archive"
-            return result
-        
-        markdown = strip_latex(tex)
-        structure = extract_structure(tex)
-        
-        result["markdown"] = f"# Paper {sid}\n\n**Source:** tex\n\n{markdown}"
-        result["json"] = structure
-        result["success"] = True
-        
-    elif mime == "pdf":
-        if not is_digital_pdf(data):
-            result["error"] = "PDF is scanned (no extractable text)"
-            return result
-        
+    # Tier 2: Digital PDF (in-memory)
+    pdf_bytes, st = download_pdf(arxiv_id)
+    if pdf_bytes and is_digital_pdf(pdf_bytes):
         result["source_type"] = "pdf"
-        structure = extract_pdf_text(data)
-        
-        md_lines = [f"# Paper {sid}", "", "**Source:** pdf", ""]
-        for page in structure.get("pages", []):
-            md_lines += [f"## Page {page['page_num']}", "", page["text"], ""]
-        
-        result["markdown"] = "\n".join(md_lines)
-        result["json"] = structure
-        result["success"] = True
+        structure = extract_pdf_structure(pdf_bytes)
+        if structure:
+            structure["title"] = title or structure.get("title", "")
+            structure["abstract"] = abstract or structure.get("abstract", "")
+            
+            md = [
+                "---", f"source_url: https://arxiv.org/abs/{sid}",
+                f"ingested: {date.today().isoformat()}", "sha256: pending", "---",
+                "", f"# {title}", "", f"**Authors:** {authors}",
+                f"**arXiv:** {sid}", "**Source:** pdf", ""
+            ]
+            if structure.get("abstract"):
+                md += ["## Abstract", "", structure["abstract"], ""]
+            for page in structure.get("pages", []):
+                md += [f"## Page {page['page_num']}", "", page["text"], ""]
+            
+            result["markdown"] = "\n".join(md)
+            result["json"] = structure
+            result["success"] = True
+            pages = len(structure.get("pages", []))
+            print(f"    ✓ PDF ({pages} pages)")
+            return result
     
+    # Tier 3: Skip (scanned or unavailable)
+    print(f"    ✗ Skipped (no TeX, no digital PDF)")
+    result["source_type"] = "skipped"
     return result
 
+# ── Entry Point ───────────────────────────────────────────────────
 
-def collect_batch(arxiv_ids: list, max_workers: int = 3) -> list:
-    """Collect multiple papers. Returns list of results."""
-    return [collect_paper(aid) for aid in arxiv_ids[:max_workers]]
-
-
-class Collector:
-    """Stateful collector with manifest tracking."""
+def main():
+    max_papers = 5
+    if "--max" in sys.argv:
+        idx = sys.argv.index("--max")
+        if idx + 1 < len(sys.argv):
+            max_papers = int(sys.argv[idx + 1])
     
-    def __init__(self, wiki_path: Path = None):
-        self.config = Config()
-        if wiki_path:
-            self.config.WIKI_PATH = Path(wiki_path)
-        self.config.ensure_dirs()
-        self.manifest = self._load_manifest()
+    if not PAPERS_JSON.exists():
+        print(f"ERROR: {PAPERS_JSON} not found"); sys.exit(1)
     
-    def _load_manifest(self) -> list:
-        if self.config.MANIFEST_PATH.exists():
-            return json.loads(self.config.MANIFEST_PATH.read_text())
-        return []
+    # Load manifest index once — O(1) lookups
+    manifest, id_set, raw_stem_set, skipped_ids = load_manifest_index()
     
-    def _save_manifest(self):
-        self.config.MANIFEST_PATH.write_text(json.dumps(self.manifest, indent=2))
+    # Flatten paper list
+    papers_data = json.loads(PAPERS_JSON.read_text())
+    all_papers = []
+    for cat, papers in papers_data.items():
+        for p in papers:
+            p["_category"] = cat
+            all_papers.append(p)
     
-    def _is_collected(self, arxiv_id: str) -> bool:
-        sid = slugify(arxiv_id)
-        return any(slugify(e.get("arxiv_id", "")) == sid for e in self.manifest)
+    # Filter using O(1) set lookups
+    to_collect = []
+    for p in all_papers:
+        sid = slugify(p["id"])
+        raw_stem = f"{date.today().isoformat()}-{sid}"
+        if not already_collected(sid, raw_stem, id_set, raw_stem_set, skipped_ids):
+            to_collect.append(p)
     
-    def collect(self, arxiv_id: str, title: str = "", authors: str = "", abstract: str = "") -> dict:
-        """Collect and save a paper. Updates manifest."""
-        if self._is_collected(arxiv_id):
-            return {"arxiv_id": arxiv_id, "success": False, "error": "Already collected"}
+    print(f"Papers to collect: {len(to_collect)} (max: {max_papers})")
+    
+    collected = skipped = failed = 0
+    
+    # Check for --retry-skipped flag
+    retry_skipped = "--retry-skipped" in sys.argv
+    if retry_skipped:
+        # Reset skipped papers to uningested
+        reset_count = 0
+        for entry in manifest:
+            if entry.get("skipped") and not entry.get("ingested"):
+                entry["skipped"] = False
+                entry["source_type"] = None
+                reset_count += 1
+        if reset_count:
+            print(f"Reset {reset_count} skipped papers for retry")
+            MANIFEST_FILE.write_text(json.dumps(manifest, indent=2))
+            print("Run again without --retry-skipped to collect the reset papers")
+        sys.exit(0)
+    
+    for paper in to_collect[:max_papers]:
+        arxiv_id = paper["id"]
+        print(f"  [{paper['_category']}] {arxiv_id}: {paper.get('title','')[:60]}...")
         
-        result = collect_paper(arxiv_id)
+        result = process_paper(
+            arxiv_id, paper.get("title",""), paper.get("authors",""),
+            paper.get("summary",""), paper["_category"]
+        )
         
         if result["success"]:
             sid = slugify(arxiv_id)
             today = date.today().isoformat()
             
-            # Save files
-            md_path = self.config.RAW_DIR / f"{today}-{sid}.md"
-            json_path = self.config.RAW_DIR / f"{today}-{sid}.json"
+            # Save markdown
+            md_path = RAW_DIR / f"{today}-{sid}.md"
             md_path.write_text(result["markdown"], encoding="utf-8")
+            
+            # Save JSON
+            json_path = RAW_DIR / f"{today}-{sid}.json"
             json_path.write_text(json.dumps(result["json"], indent=2), encoding="utf-8")
             
             # Update manifest
-            self.manifest.append({
-                "arxiv_id": arxiv_id, "title": title, "authors": authors,
-                "abstract": abstract[:500], "raw_path": str(md_path),
+            manifest.append({
+                "arxiv_id": arxiv_id, "title": paper.get("title",""),
+                "authors": paper.get("authors",""), "abstract": paper.get("summary","")[:500],
+                "category": paper["_category"], "raw_path": str(md_path),
                 "json_path": str(json_path), "source_type": result["source_type"],
-                "collected_at": today, "ingested": False
+                "collected_at": today, "ingested": False, "skipped": False
             })
-            self._save_manifest()
-        
-        return result
+            collected += 1
+        elif result["source_type"] == "skipped":
+            skipped += 1
+            # Add to manifest as skipped so it blocks the queue
+            manifest.append({
+                "arxiv_id": arxiv_id, "title": paper.get("title",""),
+                "authors": paper.get("authors",""), "abstract": paper.get("summary","")[:500],
+                "category": paper["_category"], "source_type": "skipped",
+                "collected_at": date.today().isoformat(), "ingested": False, "skipped": True
+            })
+        else:
+            failed += 1
+    
+    MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"\nDone: {collected} collected, {skipped} skipped, {failed} failed")
+    print(f"Manifest: {len(manifest)} total entries")
+
+if __name__ == "__main__":
+    main()
