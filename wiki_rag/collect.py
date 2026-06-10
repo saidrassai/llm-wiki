@@ -349,5 +349,86 @@ def main():
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(f"\nDone: {collected} collected, {skipped} skipped, {failed} failed")
 
+
+class Collector:
+    """Stateful collector with manifest tracking."""
+    
+    def __init__(self, wiki_path: Path = None):
+        self.wiki_path = wiki_path or Path.home() / "wiki-rag"
+        self.raw_dir = self.wiki_path / "raw" / "papers"
+        self.manifest_path = self.wiki_path / "manifest.json"
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest = self._load_manifest()
+    
+    def _load_manifest(self) -> list:
+        if self.manifest_path.exists():
+            return json.loads(self.manifest_path.read_text())
+        return []
+    
+    def _save_manifest(self):
+        self.manifest_path.write_text(json.dumps(self.manifest, indent=2), encoding="utf-8")
+    
+    def _is_collected(self, arxiv_id: str) -> bool:
+        sid = slugify(arxiv_id)
+        return any(
+            slugify(e.get("arxiv_id", "")) == sid 
+            for e in self.manifest 
+            if not e.get("skipped")
+        )
+    
+    def collect(self, arxiv_id: str, title: str = "", authors: str = "", abstract: str = "", category: str = "") -> dict:
+        """Collect and save a paper. Updates manifest."""
+        if self._is_collected(arxiv_id):
+            return {"arxiv_id": arxiv_id, "success": False, "error": "Already collected"}
+        
+        result = process_paper(arxiv_id, title, authors, abstract, category)
+        
+        if result["success"]:
+            sid = slugify(arxiv_id)
+            today = date.today().isoformat()
+            md_path = self.raw_dir / f"{today}-{sid}.md"
+            json_path = self.raw_dir / f"{today}-{sid}.json"
+            md_path.write_text(result["markdown"], encoding="utf-8")
+            json_path.write_text(json.dumps(result["json"], indent=2), encoding="utf-8")
+            self.manifest.append({
+                "arxiv_id": arxiv_id, "title": title, "authors": authors,
+                "abstract": abstract[:500], "category": category,
+                "raw_path": str(md_path), "json_path": str(json_path),
+                "source_type": result["source_type"], "collected_at": today,
+                "ingested": False, "skipped": False
+            })
+            self._save_manifest()
+        elif result["source_type"] == "skipped":
+            # Track skipped papers so they don't block the queue
+            self.manifest.append({
+                "arxiv_id": arxiv_id, "title": title, "authors": authors,
+                "abstract": abstract[:500], "category": category,
+                "source_type": "skipped", "collected_at": date.today().isoformat(),
+                "ingested": False, "skipped": True
+            })
+            self._save_manifest()
+        
+        return result
+    
+    def get_skipped(self) -> list:
+        """Get all skipped papers."""
+        return [e for e in self.manifest if e.get("skipped")]
+    
+    def retry_skipped(self, max_papers: int = 5) -> list:
+        """Retry skipped papers. Returns list of results."""
+        skipped = self.get_skipped()
+        results = []
+        for entry in skipped[:max_papers]:
+            # Reset skipped flag
+            entry["skipped"] = False
+            result = self.collect(
+                entry["arxiv_id"], entry.get("title", ""),
+                entry.get("authors", ""), entry.get("abstract", ""),
+                entry.get("category", "unknown")
+            )
+            results.append(result)
+        return results
+
+
 if __name__ == "__main__":
     main()
