@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "wiki-rag"
+version = "1.0.0"
+description = "Two-phase pipeline for building a RAG knowledge base from ArXiv papers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "wiki-rag contributors"},
+]
+keywords = ["arxiv", "rag", "knowledge-base", "llm", "wiki", "research"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "pymupdf>=1.25.0",
+]
+
+[project.optional-dependencies]
+cron = ["croniter>=2.0.0"]
+openai = ["openai>=1.0"]
+all = ["croniter>=2.0.0", "openai>=1.0"]
+dev = ["pytest", "black", "ruff", "mypy"]
+
+[project.scripts]
+wiki-rag-collect = "wiki_rag.collect:main"
+
+[project.urls]
+Homepage = "https://github.com/saidrassai/wiki-rag"
+Repository = "https://github.com/saidrassai/wiki-rag.git"
+Issues = "https://github.com/saidrassai/wiki-rag/issues"
+
+[tool.setuptools.packages.find]
+include = ["wiki_rag*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -261,7 +261,7 @@ def process_paper(arxiv_id, title="", authors="", abstract="", category=""):
 def main():
     # Parse args
     max_papers = 5
-    source_list = Path(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else None
+    source_list = None
     
     if "--max" in sys.argv:
         idx = sys.argv.index("--max")
@@ -274,6 +274,10 @@ def main():
             source_list = Path(sys.argv[idx + 1])
     
     retry_skipped = "--retry-skipped" in sys.argv
+    
+    # Default source list
+    if source_list is None:
+        source_list = WIKI_PATH / "categorized_papers_2024_2026.json"
     
     # Load manifest
     manifest, id_set, skipped_ids = load_manifest_index()
@@ -291,11 +295,11 @@ def main():
         sys.exit(0)
     
     # Load paper list
-    if source_list and source_list.exists():
-        papers_data = json.loads(source_list.read_text())
-    else:
-        print("No source list. Use: wiki-rag-collect --source papers.json")
+    if not source_list.exists():
+        print(f"Source list not found: {source_list}")
         sys.exit(1)
+    
+    papers_data = json.loads(source_list.read_text())
     
     # Filter already collected
     to_collect = []
