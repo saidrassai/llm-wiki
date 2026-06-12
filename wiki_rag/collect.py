@@ -5,7 +5,8 @@ wiki-rag-collect.py — Deterministic paper collector (zero LLM tokens)
 Three-tier pipeline:
   1. TeX source (best) — structure-preserving LaTeX extraction
   2. Digital PDF (fast) — PyMuPDF in-memory text block extraction
-  3. Scanned PDF — skipped (rare for ArXiv, <5%)
+  3. Complex PDF (rich) — Docling for tables, images, equations
+  4. Scanned PDF — skipped (rare for ArXiv, <5%)
 
 Usage:
   python3 wiki-rag-collect.py --max 5
@@ -17,6 +18,8 @@ import json, re, sys, tarfile, urllib.request, urllib.error
 from datetime import date
 from pathlib import Path
 from io import BytesIO
+import tempfile
+import subprocess
 
 # ── Config ────────────────────────────────────────────────────────
 WIKI_PATH = Path.home() / "wiki-rag"
@@ -136,7 +139,7 @@ def extract_tex_structure(tex: str) -> dict:
         s["figures"].append(m.group(1).strip())
     return s
 
-# ── PyMuPDF Pipeline (in-memory) ──────────────────────────────────
+# ── PyMuPDF + pymupdf4llm Pipeline (Primary) ────────────────────────
 
 def is_digital_pdf(pdf_bytes: bytes) -> bool:
     if not pdf_bytes or len(pdf_bytes) < 100:
@@ -147,13 +150,92 @@ def is_digital_pdf(pdf_bytes: bytes) -> bool:
         if len(doc) == 0:
             doc.close()
             return False
-        text_pages = sum(1 for p in doc if len(p.get_text().strip()) > 100)
+        total_pages = len(doc)
+        text_pages = 0
+        for page in doc:
+            if len(page.get_text().strip()) > 100:
+                text_pages += 1
         doc.close()
-        return text_pages / len(doc) > 0.7
+        return text_pages / total_pages > 0.7
     except:
         return False
 
+
 def extract_pdf_structure(pdf_bytes: bytes) -> dict:
+    """
+    Primary PDF extractor using pymupdf4llm (official, fast, clean markdown).
+    Returns structured dict with markdown, tables, equations, metadata.
+    """
+    try:
+        import pymupdf4llm
+        import fitz
+    except ImportError:
+        # Fallback to basic PyMuPDF if pymupdf4llm not available
+        return extract_pdf_structure_fallback(pdf_bytes)
+    
+    try:
+        # Open PDF with fitz and pass Document object to pymupdf4llm
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        # Call 1: Get full markdown with tables, equations (no chunking)
+        full_markdown = pymupdf4llm.to_markdown(
+            doc,
+            page_chunks=False,
+            ignore_headers=True,
+            ignore_footers=True,
+            use_ocr=True,
+            force_ocr=False,
+            ignore_images=False,
+            ignore_graphics=False,
+            fontsize_limit=3,
+            write_images=False,
+            embed_images=False,
+        )
+        
+        # Call 2: Get page chunks for TOC and metadata
+        chunks = pymupdf4llm.to_markdown(
+            doc,
+            page_chunks=True,
+            ignore_headers=True,
+            ignore_footers=True,
+            use_ocr=True,
+            force_ocr=False,
+            ignore_images=False,
+            ignore_graphics=False,
+            fontsize_limit=3,
+        )
+        
+        doc.close()
+        
+        # full_markdown should be a string when page_chunks=False
+        if not isinstance(full_markdown, str):
+            # Unexpected format, fallback
+            full_markdown = "\n\n".join(chunk.get("text", "") for chunk in chunks)
+        
+        # Count tables from markdown (pipe table lines)
+        tables_count = full_markdown.count('|') // 2  # rough estimate
+        
+        # First chunk metadata
+        first_chunk = chunks[0] if chunks else {}
+        toc_items = first_chunk.get("toc_items", [])
+        
+        return {
+            "markdown": full_markdown,
+            "source_type": "pdf-pymupdf4llm",
+            "pages": len(chunks),
+            "tables_count": full_markdown.count('|') // 2,
+            "images_count": 0,
+            "toc_items": chunks[0].get("toc_items", []) if chunks else [],
+            "chunks": chunks,
+        }
+    except Exception as e:
+        # Fallback on any error
+        if 'doc' in locals() and not doc.is_closed:
+            doc.close()
+        return extract_pdf_structure_fallback(pdf_bytes)
+
+def extract_pdf_structure_fallback(pdf_bytes: bytes) -> dict:
+    """Basic PyMuPDF text extraction (original logic)."""
     try:
         import fitz
     except ImportError:
@@ -173,8 +255,76 @@ def extract_pdf_structure(pdf_bytes: bytes) -> dict:
     doc.close()
     return structure
 
-# ── Download ───────────────────────────────────────────────────────
 
+def extract_with_docling(pdf_bytes: bytes, arxiv_id: str) -> dict:
+    """
+    Fallback for papers with tables/figures/equations that PyMuPDF can't handle well.
+    Uses Docling CLI for rich markdown extraction with tables, images, equations.
+    """
+    try:
+        import fitz
+        import subprocess
+        import tempfile
+        from pathlib import Path
+    except ImportError:
+        return {"success": False, "error": "Missing dependencies"}
+    
+    # Quick heuristic: check if PyMuPDF text suggests complex content
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    first_pages_text = "\n".join(p.get_text() for p in doc[:min(3, len(doc))])
+    doc.close()
+    
+    has_tables = any(kw in first_pages_text.lower() for kw in ["table 1", "table 2", "table 3", "figure 1", "figure 2", "figure 3"])
+    has_pipe_tables = "|" in first_pages_text and first_pages_text.count("|") > 10
+    has_equations = "$" in first_pages_text or "\\begin{equation}" in first_pages_text or "\\begin{align}" in first_pages_text
+    
+    # Only use Docling if complex content detected
+    if not (has_tables or has_pipe_tables or has_equations):
+        return {"success": False, "reason": "No complex content detected"}
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = Path(tmpdir) / "input.pdf"
+        pdf_path.write_bytes(pdf_bytes)
+        output_dir = Path(tmpdir) / "output"
+        
+        # Run Docling CLI (no-ocr for digital PDFs, markdown output)
+        try:
+            result = subprocess.run([
+                "docling", str(pdf_path),
+                "--to", "md",
+                "--output", str(output_dir),
+                "--no-ocr"
+            ], capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Docling timeout"}
+        except FileNotFoundError:
+            return {"success": False, "error": "Docling not installed"}
+        
+        if result.returncode != 0:
+            return {"success": False, "error": f"Docling failed: {result.stderr.decode()[:500]}"}
+        
+        # Find generated markdown file
+        md_files = list(output_dir.rglob("*.md"))
+        if not md_files:
+            return {"success": False, "error": "No markdown output"}
+        
+        markdown = md_files[0].read_text(encoding="utf-8")
+        
+        # Verify it has more structure than plain text
+        if len(markdown) < len(first_pages_text) * 0.5:
+            return {"success": False, "reason": "Output too short"}
+        
+        return {
+            "success": True,
+            "markdown": markdown,
+            "source_type": "pdf-docling",
+            "has_tables": "|" in markdown and markdown.count("|") > 10,
+            "has_images": "data:image" in markdown,
+            "has_equations": "$$" in markdown or "\\begin" in markdown
+        }
+
+
+# ── Download ───────────────────────────────────────────────────────
 def download_tex(arxiv_id: str):
     sid = slugify(arxiv_id)
     for url in [f"https://arxiv.org/e-print/{sid}", f"https://arxiv.org/src/{sid}"]:
@@ -232,8 +382,83 @@ def process_paper(arxiv_id, title="", authors="", abstract="", category=""):
     
     pdf_bytes, st = download_pdf(arxiv_id)
     if pdf_bytes and is_digital_pdf(pdf_bytes):
+        # Primary: pymupdf4llm (fast, clean markdown with tables/equations)
+        pymupdf4llm_result = extract_pdf_structure(pdf_bytes)
+        if pymupdf4llm_result and pymupdf4llm_result.get("markdown"):
+            # Check if we need Docling fallback for complex tables/headers
+            fallback_needed = False
+            fallback_reason = None
+            
+            if pymupdf4llm_result.get("chunks"):
+                for chunk in pymupdf4llm_result["chunks"]:
+                    for table in chunk.get("tables", []):
+                        # Detect cross-page tables: single row but many columns spanning
+                        if table.get("row_count", 0) == 1 and table.get("col_count", 0) > 15:
+                            fallback_needed = True
+                            fallback_reason = "suspected_cross_page_table"
+                        # Detect complex headers: many <br> in header cells
+                        if "header" in table and table["header"].get("external", False):
+                            fallback_needed = True
+                            fallback_reason = "complex_headers"
+            
+            if fallback_needed:
+                docling_result = extract_with_docling(pdf_bytes, arxiv_id)
+                if docling_result.get("success"):
+                    result["source_type"] = "pdf-docling-fallback"
+                    structure = {
+                        "title": title,
+                        "abstract": abstract,
+                        "sections": [],
+                        "pages": [{"page_num": 1, "text": docling_result["markdown"][:2000]}],
+                        "has_tables": docling_result.get("has_tables", False),
+                        "has_images": docling_result.get("has_images", False),
+                        "has_equations": docling_result.get("has_equations", False),
+                        "fallback_reason": fallback_reason
+                    }
+                    md = ["---", f"source_url: https://arxiv.org/abs/{sid}",
+                          f"ingested: {date.today().isoformat()}", "---",
+                          "", f"# {title}", "", f"**Authors:** {authors}",
+                          f"**arXiv:** {sid}", f"**Source:** pdf-docling ({fallback_reason})", ""]
+                    if abstract:
+                        md += ["## Abstract", "", abstract, ""]
+                    md += [docling_result["markdown"]]
+                    result["markdown"] = "\n".join(md)
+                    result["json"] = structure
+                    result["success"] = True
+                    print(f"    ✓ PDF-Docling-fallback [{fallback_reason}]")
+                    return result
+            
+            # Success with pymupdf4llm
+            result["source_type"] = "pdf-pymupdf4llm"
+            structure = {
+                "title": title,
+                "abstract": abstract,
+                "sections": pymupdf4llm_result.get("toc_items", []),
+                "markdown": pymupdf4llm_result["markdown"],
+                "tables_count": pymupdf4llm_result.get("tables_count", 0),
+                "images_count": pymupdf4llm_result.get("images_count", 0),
+                "chunks": pymupdf4llm_result.get("chunks", [])
+            }
+            md = ["---", f"source_url: https://arxiv.org/abs/{sid}",
+                  f"ingested: {date.today().isoformat()}", "---",
+                  "", f"# {title}", "", f"**Authors:** {authors}",
+                  f"**arXiv:** {sid}", "**Source:** pdf-pymupdf4llm", ""]
+            if abstract:
+                md += ["## Abstract", "", abstract, ""]
+            md += [pymupdf4llm_result["markdown"]]
+            result["markdown"] = "\n".join(md)
+            result["json"] = structure
+            result["success"] = True
+            extras = []
+            if pymupdf4llm_result.get("tables_count", 0) > 0: extras.append("tables")
+            if pymupdf4llm_result.get("images_count", 0) > 0: extras.append("images")
+            extra_str = f" [{', '.join(extras)}]" if extras else ""
+            print(f"    ✓ PDF-pymupdf4llm{extra_str} ({pymupdf4llm_result.get('pages', 0)} pages)")
+            return result
+        
+        # Fallback to basic PyMuPDF text extraction
         result["source_type"] = "pdf"
-        structure = extract_pdf_structure(pdf_bytes)
+        structure = extract_pdf_structure_fallback(pdf_bytes)
         if structure:
             structure["title"] = title or structure.get("title", "")
             structure["abstract"] = abstract or structure.get("abstract", "")
