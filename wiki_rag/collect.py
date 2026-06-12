@@ -20,6 +20,10 @@ from pathlib import Path
 from io import BytesIO
 import tempfile
 import subprocess
+from wiki_rag.detect import analyze_tex, analyze_pdf, analyze_html, decide_strategy
+from wiki_rag.tables import extract_tables_from_tex, extract_tables_from_pymupdf4llm, extract_tables_from_docling, extract_tables_from_html
+from wiki_rag.structure import extract_structure_from_tex, extract_structure_from_html
+from wiki_rag.merge import merge_structure_with_tables, build_hybrid_markdown, decide_final_source_type
 
 # ── Config ────────────────────────────────────────────────────────
 WIKI_PATH = Path.home() / "wiki-rag"
@@ -62,9 +66,18 @@ def load_manifest_index() -> tuple:
 # ── TeX Pipeline ──────────────────────────────────────────────────
 
 def strip_latex(text: str) -> str:
-    """Structure-preserving LaTeX to markdown conversion."""
-    text = re.sub(r'(?<!\\)%.*$', '', text, flags=re.MULTILINE)
+    """Structure-preserving LaTeX to markdown conversion.
+
+    Preserves:
+    - Equations: $$...$$ → ```math ... ```, $...$ → $...$
+    - Tables: tabular, tabular*, longtable, tabularx with booktabs
+    - Citations and cross-references: \cite, \ref, \eqref, etc.
+    - Section structure
+    """
+    # Remove comments
+    text = re.sub(r'(?<!\\\\)%.*$', '', text, flags=re.MULTILINE)
     
+    # Extract document body
     doc_start = re.search(r'\\begin\{document\}', text)
     doc_end = re.search(r'\\end\{document\}', text)
     if doc_start and doc_end:
@@ -72,55 +85,187 @@ def strip_latex(text: str) -> str:
     elif doc_start:
         text = text[doc_start.end():]
     
+    # Remove preamble
     text = re.sub(r'\\documentclass(\[[^\]]*\])?\{[^}]*\}', '', text)
     text = re.sub(r'\\usepackage(\[[^\]]*\])?\{[^}]*\}', '', text)
     text = re.sub(r'\\(newcommand|renewcommand|def)(\[[^\]]*\])?\{[^}]*\}(\[[^\]]*\])?(\{[^}]*\})?', '', text)
-    text = _convert_tabular(text)
     
-    for env in ['figure', 'table', 'table*', 'algorithm', 'algorithmic', 'tikzpicture',
-                'itemize', 'enumerate', 'description', 'verbatim', 'lstlisting', 'minipage']:
-        text = re.sub(r'\\begin\{' + env + r'\}.*?\\end\{' + env + r'\}', '', text, flags=re.DOTALL)
+    # ===== EQUATIONS: Convert to Markdown math =====
+    # Display equations: $$...$$ → ```math ... ```
+    text = re.sub(r'\$\$(.*?)\$\$', r'\n```math\n\1\n```\n', text, flags=re.DOTALL)
+    # Display equations: \[...\] → ```math ... ```
+    text = re.sub(r'\\\[(.*?)\\\]', r'\n```math\n\1\n```\n', text, flags=re.DOTALL)
+    # Display equations: \begin{equation}...\end{equation} → ```math ... ```
+    text = re.sub(r'\\begin\{equation\*?\}(.*?)\\end\{equation\*?\}', r'\n```math\n\1\n```\n', text, flags=re.DOTALL)
+    # Align/eqnarray environments
+    text = re.sub(r'\\begin\{(align|eqnarray|gather|multline)\*?\}(.*?)\\end\{(align|eqnarray|gather|multline)\*?\}', 
+                  r'\n```math\n\2\n```\n', text, flags=re.DOTALL)
+    # Inline equations: $...$ → $...$ (preserve with spacing)
+    text = re.sub(r'(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', r' $\1$ ', text)
     
+    # ===== TABLES: Convert LaTeX tables to Markdown =====
+    # Handle tabular, tabular*, longtable, tabularx
+    text = _convert_latex_tables(text)
+    
+    # ===== SECTIONS =====
     text = re.sub(r'\\section\*?\{([^}]*)\}', r'\n## \1\n', text)
     text = re.sub(r'\\subsection\*?\{([^}]*)\}', r'\n### \1\n', text)
     text = re.sub(r'\\subsubsection\*?\{([^}]*)\}', r'\n#### \1\n', text)
     
+    # ===== FORMATTING =====
     for cmd in ['textbf', 'textit', 'emph', 'underline', 'textsc', 'texttt',
                 'mathrm', 'mathit', 'mathbf', 'mathbb', 'mathcal', 'mathfrak', 'text']:
         text = re.sub(r'\\' + cmd + r'\{([^}]*)\}', r'\1', text)
     
-    text = re.sub(r'\\(label|ref|eqref|autoref|pageref|cite\w*|nocite|parencite|textcite)\*?(\[[^\]]*\])?\{[^}]*\}', '', text)
-    text = re.sub(r'\\url\{([^}]*)\}', r'\1', text)
-    text = re.sub(r'\\href\{[^}]*\}\{([^}]*)\}', r'\1', text)
-    text = re.sub(r'\\footnote\{[^{}]*(\{[^}]*\}[^{}]*)*\}', '', text)
+    # ===== CITATIONS & CROSS-REFS: Preserve as markdown links =====
+    # \cite{key} → [@key]
+    text = re.sub(r'\\cite\w*(\[[^\]]*\])?\{([^}]*)\}', r'[@\2]', text)
+    # \ref{label} → [#label]
+    text = re.sub(r'\\ref\{([^}]*)\}', r'[#\1]', text)
+    # \eqref{label} → [Eq. #label]
+    text = re.sub(r'\\eqref\{([^}]*)\}', r'[Eq. #\1]', text)
+    # \autoref{label} → [@label]
+    text = re.sub(r'\\autoref\{([^}]*)\}', r'[@\1]', text)
+    # \label{label} → <!-- label: label -->
+    text = re.sub(r'\\label\{([^}]*)\}', r'<!-- label: \1 -->', text)
+    
+    # ===== LINKS =====
+    text = re.sub(r'\\url\{([^}]*)\}', r'<\1>', text)
+    text = re.sub(r'\\href\{([^}]*)\}\{([^}]*)\}', r'[\2](\1)', text)
+    
+    # ===== FOOTNOTES =====
+    text = re.sub(r'\\footnote\{([^{}]*(\{[^}]*\}[^{}]*)*)\}', r'[^fn]', text)
+    
+    # ===== CAPTIONS =====
     text = re.sub(r'\\caption\*?\{([^}]*)\}', r'\n**Caption:** \1\n', text)
+    
+    # ===== REMOVE REMAINING ENVIRONMENTS =====
+    for env in ['figure', 'table', 'table*', 'algorithm', 'algorithmic', 'tikzpicture',
+                'itemize', 'enumerate', 'description', 'verbatim', 'lstlisting', 'minipage']:
+        text = re.sub(r'\\begin\{' + env + r'\}.*?\\end\{' + env + r'\}', '', text, flags=re.DOTALL)
+    
+    # ===== CLEANUP =====
+    # Remove remaining control sequences (but preserve our preserved $...$)
     text = re.sub(r'\\[a-zA-Z]+\*?(?:\[[^\]]*\])?(?:\{[^}]*\})?', '', text)
     text = re.sub(r'\\[a-zA-Z]+\b', '', text)
-    text = re.sub(r'\$[^$]+\$', '', text)
+    
+    # Remove braces but preserve math braces
+    # Temporarily protect $...$ content
+    math_parts = re.findall(r'(\$[^$\n]+\$)', text)
+    for i, part in enumerate(math_parts):
+        text = text.replace(part, f'__MATH_{i}__')
     text = re.sub(r'[{}]', '', text)
+    for i, part in enumerate(math_parts):
+        text = text.replace(f'__MATH_{i}__', part)
+    
+    # Cleanup whitespace
     text = re.sub(r' {3,}', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     
     return text.strip()
 
-def _convert_tabular(text: str) -> str:
-    """Convert LaTeX tabular to markdown table."""
-    def replace(m):
+
+def _convert_latex_tables(text: str) -> str:
+    """Convert LaTeX tables (tabular, tabular*, longtable, tabularx) to Markdown.
+    Also handles table and table* wrapper environments."""
+    # Pattern to match various table environments
+    # FIRST: handle table/table* wrapper environments (extract tabular from inside)
+    table_wrapper_pattern = (r'\\begin\{table\*?\}\[?[^\]]*\]?', r'\\end\{table\*?\}')
+    text = _convert_single_table_env(text, *table_wrapper_pattern)
+    
+    # THEN: handle direct tabular environments
+    table_patterns = [
+        (r'\\begin\{tabular\*?\}', r'\\end\{tabular\*?\}'),
+        (r'\\begin\{longtable\}', r'\\end\{longtable\}'),
+        (r'\\begin\{tabularx\}', r'\\end\{tabularx\}'),
+    ]
+    
+    for start_pat, end_pat in table_patterns:
+        text = _convert_single_table_env(text, start_pat, end_pat)
+    
+    return text
+
+
+def _convert_single_table_env(text: str, start_pat: str, end_pat: str) -> str:
+    """Convert a single table environment to Markdown."""
+    
+    def replace_table(m):
         content = m.group(1)
+        
+        # For table/table* wrapper environments, extract tabular inside
+        if 'table' in start_pat and 'tabular' not in start_pat:
+            # Extract tabular environment from inside table wrapper
+            tabular_match = re.search(r'\\begin\{tabular\*?\}(.*?)\\end\{tabular\*?\}', content, flags=re.DOTALL)
+            if not tabular_match:
+                return ''  # No tabular found inside table wrapper
+            content = tabular_match.group(1)
+        
+        # Remove booktabs commands
+        content = re.sub(r'\\toprule\s*', '', content)
+        content = re.sub(r'\\midrule\s*', '', content)
+        content = re.sub(r'\\bottomrule\s*', '', content)
+        content = re.sub(r'\\cmidrule(\[[^\]]*\])?\{[^}]*\}', '', content)
+        content = re.sub(r'\\addlinespace(\[\w+\])?', '', content)
+        
+        # Remove hline
+        content = re.sub(r'\\hline', '', content)
+        
+        # Remove positioning commands from table wrapper
+        content = re.sub(r'\\centering', '', content)
+        content = re.sub(r'\[[htbp!]+\]', '', content)  # [h], [t], [b], [p], [!]
+        
+        # Remove hline
+        content = re.sub(r'\\hline', '', content)
+        
+        # Split rows
         rows = re.sub(r'\\\\', '\n', content)
-        rows = re.sub(r'\\hline', '', rows)
         lines = [l.strip() for l in rows.split('\n') if l.strip()]
         if not lines:
             return ''
+        
         md = []
         for line in lines:
+            # Handle multicolumn
+            line = _convert_multicolumn(line)
+            # Convert & to |
             line = re.sub(r'\s*&\s*', ' | ', line.strip('&').strip())
             md.append(f'| {line} |')
+        
         if len(md) > 1:
             cols = md[0].count('|') - 1
             md.insert(1, '|' + ' --- |' * cols)
+        
         return '\n' + '\n'.join(md) + '\n'
-    return re.sub(r'\\begin\{tabular\}\{[^}]*\}(.*?)\\end\{tabular\}', replace, text, flags=re.DOTALL)
+    
+    # Replace table environment
+    pattern = start_pat + r'(.*?)' + end_pat
+    return re.sub(pattern, replace_table, text, flags=re.DOTALL)
+
+
+def _convert_multicolumn(line: str) -> str:
+    """Convert \multicolumn{N}{c}{text} to repeated cells."""
+    # \multicolumn{N}{c}{text} → repeat text N times
+    def replace_mc(m):
+        n = int(m.group(1))
+        text = m.group(2)
+        return ' | '.join([text] * n)
+    return re.sub(r'\\multicolumn\{(\d+)\}\{[^}]*\}\{([^}]*)\}', replace_mc, line)
+
+
+def _clean_table_markdown(text: str) -> str:
+    """Clean up pymupdf4llm table markdown: replace <br> with spaces, fix headers."""
+    # Replace <br> with space in table rows (within |...|)
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        if line.strip().startswith('|') and line.strip().endswith('|'):
+            # This looks like a table row - replace <br> with space
+            line = line.replace('<br>', ' ')
+            line = line.replace('<br/>', ' ')
+            line = line.replace('<br />', ' ')
+        cleaned.append(line)
+    return '\n'.join(cleaned)
+
 
 def extract_tex_structure(tex: str) -> dict:
     """Extract structured data from TeX."""
@@ -357,15 +502,76 @@ def download_pdf(arxiv_id: str):
             continue
     return None, "failed"
 
+
+def download_html(arxiv_id: str):
+    """Download ArXiv HTML version (available for papers since ~2023)."""
+    sid = slugify(arxiv_id)
+    for url in [f"https://arxiv.org/html/{sid}", f"https://arxiv.org/html/{sid}/index.html"]:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'wiki-rag/1.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            # Check if it's actually HTML (not a redirect to PDF)
+            if data.startswith(b'<') or data.startswith(b'<!DOCTYPE'):
+                return data.decode('utf-8', errors='replace'), "html"
+        except:
+            continue
+    return None, "failed"
+
+
+def has_complex_tex_tables(tex: str) -> bool:
+    """Detect complex table features in TeX that our strip_latex can't handle well."""
+    if not tex:
+        return False
+    
+    # Look for complex table features in TeX
+    complex_indicators = [
+        r'\\multirow',           # Multi-row cells
+        r'\\multicolumn',         # Multi-column cells (beyond simple)
+        r'\\cmidrule',           # Partial horizontal rules
+        r'\\begin\{tabular\*?\}[^}]*@\{.*@\}',  # Complex column specs with @{}
+        r'\\begin\{tabular\*?\}[^}]*\|',  # Vertical lines in column spec
+        r'\\begin\{longtable\}',  # Long tables
+        r'\\begin\{tabularx\}',   # Tabularx environment
+        r'\\hline.*\\hline',      # Multiple consecutive hlines
+        r'\\cline',               # Partial horizontal rules
+    ]
+    
+    # Count occurrences
+    score = 0
+    for pattern in complex_indicators:
+        matches = len(re.findall(pattern, tex, flags=re.DOTALL))
+        score += matches
+    
+    # Consider complex if 3+ indicators found
+    return score >= 3
+
+
 # ── Main Pipeline ─────────────────────────────────────────────────
 
 def process_paper(arxiv_id, title="", authors="", abstract="", category=""):
     sid = slugify(arxiv_id)
     result = {"arxiv_id": arxiv_id, "source_type": None, "markdown": "", "json": {}, "success": False}
     
-    tex, st = download_tex(arxiv_id)
-    if tex:
-        result["source_type"] = "tex"
+    # 1. Download ALL available sources
+    tex, _ = download_tex(arxiv_id)
+    pdf_bytes, _ = download_pdf(arxiv_id)
+    html, _ = download_html(arxiv_id)
+    
+    # 2. Analyze each source
+    tex_profile = analyze_tex(tex) if tex else None
+    pdf_profile = analyze_pdf(pdf_bytes) if pdf_bytes else None
+    html_profile = analyze_html(html) if html else None
+    
+    # 3. Decide strategy
+    strategy = decide_strategy(tex_profile, pdf_profile, html_profile)
+    print(f"    Strategy: {strategy} (TeX: {tex_profile.recommended_extractor if tex_profile else 'none'}, PDF: {pdf_profile.recommended_extractor if pdf_profile else 'none'}, HTML: {html_profile.recommended_extractor if html_profile else 'none'})")
+    
+    # 4. Execute strategy
+    fallback_used = False
+    
+    if strategy == "tex_only":
+        # TeX handles everything
         clean = strip_latex(tex)
         structure = extract_tex_structure(tex)
         structure["title"] = title or structure.get("title", "")
@@ -376,87 +582,169 @@ def process_paper(arxiv_id, title="", authors="", abstract="", category=""):
               f"**arXiv:** {sid}", "**Source:** tex", "", "## Abstract", "", abstract, "", clean]
         result["markdown"] = "\n".join(md)
         result["json"] = structure
+        result["source_type"] = "tex"
         result["success"] = True
-        print(f"    ✓ TeX ({len(clean)} chars, {len(structure['sections'])} sections)")
+        print(f"    ✓ TeX-only ({len(clean)} chars, {len(structure['sections'])} sections)")
         return result
     
-    pdf_bytes, st = download_pdf(arxiv_id)
-    if pdf_bytes and is_digital_pdf(pdf_bytes):
-        # Primary: pymupdf4llm (fast, clean markdown with tables/equations)
-        pymupdf4llm_result = extract_pdf_structure(pdf_bytes)
-        if pymupdf4llm_result and pymupdf4llm_result.get("markdown"):
-            # Check if we need Docling fallback for complex tables/headers
-            fallback_needed = False
-            fallback_reason = None
+    elif strategy == "tex+pymupdf4llm":
+        # HYBRID: TeX for structure, pymupdf4llm for tables
+        if not tex or not pdf_bytes:
+            print(f"    ⚠ Missing source for hybrid, falling back")
+            # Fall through
+        else:
+            struct = extract_structure_from_tex(tex)
+            tables = extract_tables_from_pymupdf4llm(pdf_bytes)
             
-            if pymupdf4llm_result.get("chunks"):
-                for chunk in pymupdf4llm_result["chunks"]:
-                    for table in chunk.get("tables", []):
-                        # Detect cross-page tables: single row but many columns spanning
-                        if table.get("row_count", 0) == 1 and table.get("col_count", 0) > 15:
-                            fallback_needed = True
-                            fallback_reason = "suspected_cross_page_table"
-                        # Detect complex headers: many <br> in header cells
-                        if "header" in table and table["header"].get("external", False):
-                            fallback_needed = True
-                            fallback_reason = "complex_headers"
+            # Merge tables into structure
+            merged_struct = merge_structure_with_tables(struct, tables)
             
-            if fallback_needed:
-                docling_result = extract_with_docling(pdf_bytes, arxiv_id)
-                if docling_result.get("success"):
-                    result["source_type"] = "pdf-docling-fallback"
-                    structure = {
-                        "title": title,
-                        "abstract": abstract,
-                        "sections": [],
-                        "pages": [{"page_num": 1, "text": docling_result["markdown"][:2000]}],
-                        "has_tables": docling_result.get("has_tables", False),
-                        "has_images": docling_result.get("has_images", False),
-                        "has_equations": docling_result.get("has_equations", False),
-                        "fallback_reason": fallback_reason
-                    }
-                    md = ["---", f"source_url: https://arxiv.org/abs/{sid}",
-                          f"ingested: {date.today().isoformat()}", "---",
-                          "", f"# {title}", "", f"**Authors:** {authors}",
-                          f"**arXiv:** {sid}", f"**Source:** pdf-docling ({fallback_reason})", ""]
-                    if abstract:
-                        md += ["## Abstract", "", abstract, ""]
-                    md += [docling_result["markdown"]]
-                    result["markdown"] = "\n".join(md)
-                    result["json"] = structure
-                    result["success"] = True
-                    print(f"    ✓ PDF-Docling-fallback [{fallback_reason}]")
-                    return result
+            # Build markdown
+            source_type = decide_final_source_type(tex_profile, pdf_profile, strategy, fallback_used)
+            markdown = build_hybrid_markdown(
+                merged_struct, source_type, arxiv_id, title, authors, abstract, tables
+            )
             
-            # Success with pymupdf4llm
-            result["source_type"] = "pdf-pymupdf4llm"
-            structure = {
+            result["markdown"] = markdown
+            result["json"] = {
                 "title": title,
                 "abstract": abstract,
-                "sections": pymupdf4llm_result.get("toc_items", []),
-                "markdown": pymupdf4llm_result["markdown"],
-                "tables_count": pymupdf4llm_result.get("tables_count", 0),
-                "images_count": pymupdf4llm_result.get("images_count", 0),
-                "chunks": pymupdf4llm_result.get("chunks", [])
+                "sections": [{"level": s.level, "title": s.title} for s in merged_struct.sections],
+                "equations": len(merged_struct.equations),
+                "citations": len(merged_struct.citations),
+                "figures": len(merged_struct.figures),
+                "tables_count": len(tables),
             }
+            result["source_type"] = source_type
+            result["success"] = True
+            print(f"    ✓ TeX+pymupdf4llm hybrid ({len(tables)} tables merged)")
+            return result
+    
+    elif strategy == "tex+pymupdf4llm+docling":
+        # HYBRID with Docling fallback for complex tables
+        if not tex or not pdf_bytes:
+            print(f"    ⚠ Missing source for hybrid, falling back")
+            # Fall through
+        else:
+            struct = extract_structure_from_tex(tex)
+            tables = extract_tables_from_pymupdf4llm(pdf_bytes)
+            
+            # Check if any tables need Docling
+            docling_tables = []
+            remaining_tables = list(tables)
+            
+            for table in tables:
+                if table.row_count == 1 and table.col_count > 15:  # cross-page
+                    docling_result = extract_tables_from_docling(pdf_bytes)
+                    if docling_result:
+                        docling_tables.extend(docling_result)
+                        fallback_used = True
+            
+            all_tables = tables + docling_tables
+            merged_struct = merge_structure_with_tables(struct, all_tables)
+            
+            source_type = decide_final_source_type(tex_profile, pdf_profile, strategy, fallback_used)
+            markdown = build_hybrid_markdown(
+                merged_struct, source_type, arxiv_id, title, authors, abstract, all_tables
+            )
+            
+            result["markdown"] = markdown
+            result["json"] = {
+                "title": title,
+                "abstract": abstract,
+                "sections": [{"level": s.level, "title": s.title} for s in merged_struct.sections],
+                "equations": len(merged_struct.equations),
+                "citations": len(merged_struct.citations),
+                "figures": len(merged_struct.figures),
+                "tables_count": len(all_tables),
+            }
+            result["source_type"] = source_type
+            result["success"] = True
+            print(f"    ✓ TeX+pymupdf4llm+Docling hybrid ({len(all_tables)} tables, fallback={fallback_used})")
+            return result
+    
+    elif strategy == "pymupdf4llm":
+        # PDF only, use pymupdf4llm
+        if not pdf_bytes:
+            print(f"    ⚠ No PDF for pymupdf4llm, falling back")
+        else:
+            pdf_result = extract_pdf_structure(pdf_bytes)
+            if pdf_result and pdf_result.get("markdown"):
+                md_text = _clean_table_markdown(pdf_result["markdown"])
+                
+                md = ["---", f"source_url: https://arxiv.org/abs/{sid}",
+                      f"ingested: {date.today().isoformat()}", "---",
+                      "", f"# {title}", "", f"**Authors:** {authors}",
+                      f"**arXiv:** {sid}", "**Source:** pdf-pymupdf4llm", ""]
+                if abstract:
+                    md += ["## Abstract", "", abstract, ""]
+                md += [md_text]
+                
+                result["markdown"] = "\n".join(md)
+                result["json"] = {
+                    "title": title,
+                    "abstract": abstract,
+                    "sections": pdf_result.get("toc_items", []),
+                    "tables_count": pdf_result.get("tables_count", 0),
+                    "images_count": pdf_result.get("images_count", 0),
+                }
+                result["source_type"] = "pdf-pymupdf4llm"
+                result["success"] = True
+                print(f"    ✓ PDF-pymupdf4llm ({pdf_result.get('pages', 0)} pages)")
+                return result
+    
+    elif strategy == "docling":
+        # PDF only, use Docling
+        if not pdf_bytes:
+            print(f"    ⚠ No PDF for Docling, falling back")
+        else:
+            docling_result = extract_with_docling(pdf_bytes, arxiv_id)
+            if docling_result.get("success"):
+                md = ["---", f"source_url: https://arxiv.org/abs/{sid}",
+                      f"ingested: {date.today().isoformat()}", "---",
+                      "", f"# {title}", "", f"**Authors:** {authors}",
+                      f"**arXiv:** {sid}", "**Source:** pdf-docling", ""]
+                if abstract:
+                    md += ["## Abstract", "", abstract, ""]
+                md += [docling_result["markdown"]]
+                
+                result["markdown"] = "\n".join(md)
+                result["source_type"] = "pdf-docling"
+                result["success"] = True
+                print(f"    ✓ PDF-docling")
+                return result
+    
+    elif strategy == "html":
+        # HTML fallback
+        if not html:
+            print(f"    ⚠ No HTML, falling back")
+        else:
+            struct = extract_structure_from_html(html)
+            tables = extract_tables_from_html(html)
+            merged_struct = merge_structure_with_tables(struct, tables)
+            
             md = ["---", f"source_url: https://arxiv.org/abs/{sid}",
                   f"ingested: {date.today().isoformat()}", "---",
                   "", f"# {title}", "", f"**Authors:** {authors}",
-                  f"**arXiv:** {sid}", "**Source:** pdf-pymupdf4llm", ""]
+                  f"**arXiv:** {sid}", "**Source:** html", ""]
             if abstract:
                 md += ["## Abstract", "", abstract, ""]
-            md += [pymupdf4llm_result["markdown"]]
+            md += [merged_struct.clean_text]
+            
             result["markdown"] = "\n".join(md)
-            result["json"] = structure
+            result["json"] = {
+                "title": title,
+                "abstract": abstract,
+                "sections": [{"level": s.level, "title": s.title} for s in merged_struct.sections],
+                "tables_count": len(tables),
+            }
+            result["source_type"] = "html"
             result["success"] = True
-            extras = []
-            if pymupdf4llm_result.get("tables_count", 0) > 0: extras.append("tables")
-            if pymupdf4llm_result.get("images_count", 0) > 0: extras.append("images")
-            extra_str = f" [{', '.join(extras)}]" if extras else ""
-            print(f"    ✓ PDF-pymupdf4llm{extra_str} ({pymupdf4llm_result.get('pages', 0)} pages)")
+            print(f"    ✓ HTML ({len(tables)} tables)")
             return result
-        
-        # Fallback to basic PyMuPDF text extraction
+    
+    # Fallback to basic PDF text extraction
+    if pdf_bytes and is_digital_pdf(pdf_bytes):
         result["source_type"] = "pdf"
         structure = extract_pdf_structure_fallback(pdf_bytes)
         if structure:
@@ -474,10 +762,12 @@ def process_paper(arxiv_id, title="", authors="", abstract="", category=""):
             result["json"] = structure
             result["success"] = True
             pages = len(structure.get("pages", []))
-            print(f"    ✓ PDF ({pages} pages)")
+            print(f"    ✓ PDF fallback ({pages} pages)")
             return result
     
-    print(f"    ✗ Skipped (no TeX, no digital PDF)")
+    print(f"    ✗ Skipped (no viable source)")
+    result["source_type"] = "skipped"
+    return result
     result["source_type"] = "skipped"
     return result
 
